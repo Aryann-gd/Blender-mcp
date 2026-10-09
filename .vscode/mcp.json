@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "blender-lite": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["${workspaceFolder}/mcp_server.py"],
+      "env": {
+        "BLENDER_HOST": "127.0.0.1",
+        "BLENDER_PORT": "9877"
+      }
+    }
+  }
+}
