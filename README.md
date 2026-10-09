@@ -2,6 +2,8 @@
 
 A lightweight, single-source MCP integration for Blender 3.1. The same `mcp_server.py` runs as a stdio MCP server under regular Python and as the Blender add-on that exposes the live `bpy` runtime over localhost.
 
+This project is licensed under the MIT License; see [LICENSE](LICENSE).
+
 ## Requirements
 
 - Blender 3.1.0
