@@ -5,16 +5,7 @@ add-on to provide the live bpy endpoint. Blender and MCP use separate runtimes,
 so the add-on mode and stdio mode are two entry points in this one source file.
 """
 
-bl_info = {
-    "name": "Blender MCP (Single File)",
-    "author": "Workspace",
-    "version": (1, 2, 0),
-    "blender": (3, 1, 0),
-    "location": "Edit > Preferences > Add-ons",
-    "description": "MCP bridge and local Blender control add-on",
-    "category": "System",
-}
-
+import ast
 import contextlib
 import io
 import json
@@ -31,8 +22,17 @@ try:
 except ImportError:
     bpy = None
 
+bl_info = {
+    "name": "Blender MCP (Single File)",
+    "author": "Workspace",
+    "version": (1, 2, 0),
+    "blender": (3, 1, 0),
+    "location": "Edit > Preferences > Add-ons",
+    "description": "MCP bridge and local Blender control add-on",
+    "category": "System",
+}
+
 HOST = os.environ.get("BLENDER_HOST", "127.0.0.1")
-# Use a new default while the previous add-on version may still own 9876.
 PORT = int(os.environ.get("BLENDER_PORT", "9877"))
 PROTOCOL_VERSION = "2024-11-05"
 COMMAND_QUEUE = Queue()
@@ -40,8 +40,6 @@ _SERVER_THREAD = None
 _SERVER_SOCKET = None
 _SERVER_STOP = threading.Event()
 
-
-# MCP tool declarations are in the same file as the Blender implementation.
 TOOLS = [
     {
         "name": "get_addon_status",
@@ -76,6 +74,11 @@ TOOLS = [
             "required": ["code"],
             "additionalProperties": False,
         },
+    },
+    {
+        "name": "clear_undo_history",
+        "description": "Free undo memory and reduce RAM pressure before heavy Blender operations.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "build_house",
@@ -150,6 +153,68 @@ TOOLS = [
         },
     },
     {
+        "name": "unwrap_uv_mesh",
+        "description": "Select a mesh, unwrap it with the requested UV method, and return to object mode.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "object_name": {"type": "string", "description": "Mesh object to unwrap."},
+                "method": {"type": "string", "enum": ["SMART", "LIGHTMAP", "ANGLE"], "description": "UV unwrap method."},
+                "island_margin": {"type": "number", "description": "UV island margin."},
+            },
+            "required": ["object_name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "setup_hdri_lighting",
+        "description": "Configure the World shader with an environment texture, mapping, and HDRI strength.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filepath": {"type": "string", "description": "Path to the HDR image file."},
+                "strength": {"type": "number", "description": "Background strength."},
+                "rotation_z": {"type": "number", "description": "Z-axis rotation in degrees."},
+            },
+            "required": ["filepath"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "purge_orphan_data",
+        "description": "Purge orphan datablocks to free Blender memory on low-end systems.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "manage_geometry_nodes",
+        "description": "Add or remove a Geometry Nodes modifier and node group on a mesh object.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "object_name": {"type": "string", "description": "Target mesh object."},
+                "action": {"type": "string", "enum": ["ADD", "REMOVE"], "description": "Add or remove a Geometry Nodes modifier."},
+                "node_group_name": {"type": "string", "description": "Optional node group name."},
+            },
+            "required": ["object_name", "action"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "manage_shape_keys",
+        "description": "Add or set shape keys on a mesh object, including basis and target keys.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "object_name": {"type": "string", "description": "Target mesh object."},
+                "action": {"type": "string", "enum": ["ADD_BASIS", "ADD_TARGET", "SET_VALUE"], "description": "Shape key action."},
+                "shape_key_name": {"type": "string", "description": "Shape key name."},
+                "value": {"type": "number", "description": "Value for SET_VALUE."},
+            },
+            "required": ["object_name", "action"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "setup_compositing",
         "description": "Create a simple Render Layers to Composite graph, optionally inserting Blender 3.1 Fog Glow. Replaces the current compositor node graph by default.",
         "inputSchema": {
@@ -191,10 +256,7 @@ TOOLS = [
 ]
 
 
-# -------------------------- Blender-side implementation ---------------------
-
 def _safe_json(value):
-    """Convert common Blender/Python values to JSON-safe values."""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, dict):
@@ -218,7 +280,6 @@ def _make_material(name, color):
 
 
 def _make_box(name, location, dimensions, material, rotation=(0.0, 0.0, 0.0)):
-    # Direct mesh construction avoids context-sensitive operators and modifiers.
     vertices = [
         (-0.5, -0.5, -0.5), (0.5, -0.5, -0.5),
         (0.5, 0.5, -0.5), (-0.5, 0.5, -0.5),
@@ -254,11 +315,50 @@ def _make_gables(material):
     return obj
 
 
+def _clear_undo_history():
+    try:
+        bpy.ops.ed.undo_push(message="MCP Step")
+    except Exception:
+        pass
+    for operator_name in ("ED_OT_undo_history_clear", "ED_OT_undo_clear", "ED_OT_undo"):
+        try:
+            op_name = operator_name.split("ED_OT_")[1]
+            operator = getattr(bpy.ops.ed, op_name, None)
+            if operator is not None:
+                operator()
+        except Exception:
+            pass
+    return {"status": "success", "message": "Undo history was reset to reduce memory pressure."}
+
+
+def validate_object(object_name, expected_types=None):
+    if not isinstance(object_name, str) or not object_name.strip():
+        return {"status": "error", "message": "Object name is required."}
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        return {"status": "error", "message": "Object not found: {}".format(object_name)}
+    if obj.hide_get():
+        return {"status": "error", "message": "Object is hidden and cannot be edited: {}".format(object_name)}
+    lock_location = getattr(obj, "lock_location", (False, False, False))
+    lock_rotation = getattr(obj, "lock_rotation", (False, False, False))
+    lock_scale = getattr(obj, "lock_scale", (False, False, False))
+    if isinstance(lock_location, (tuple, list)) and any(lock_location):
+        return {"status": "error", "message": "Object is location-locked and cannot be edited: {}".format(object_name)}
+    if isinstance(lock_rotation, (tuple, list)) and any(lock_rotation):
+        return {"status": "error", "message": "Object is rotation-locked and cannot be edited: {}".format(object_name)}
+    if isinstance(lock_scale, (tuple, list)) and any(lock_scale):
+        return {"status": "error", "message": "Object is scale-locked and cannot be edited: {}".format(object_name)}
+    if expected_types is not None:
+        expected = tuple(str(item).upper() for item in expected_types)
+        if obj.type is not None and obj.type.upper() not in expected:
+            return {"status": "error", "message": "Object '{}' is type '{}' but expected one of {}.".format(object_name, obj.type, expected)}
+    return obj
+
+
 def _build_house(clear_scene=True):
     if clear_scene:
         for obj in list(bpy.context.scene.objects):
             bpy.data.objects.remove(obj, do_unlink=True)
-
     walls = _make_material("House Warm Ivory", (0.78, 0.62, 0.40, 1.0))
     roof = _make_material("House Terracotta", (0.38, 0.075, 0.045, 1.0))
     trim = _make_material("House Cream Trim", (0.92, 0.84, 0.68, 1.0))
@@ -269,10 +369,8 @@ def _build_house(clear_scene=True):
     _make_box("House Walls", (0.0, 0.0, 1.5), (4.0, 3.0, 3.0), walls)
     _make_gables(walls)
     roof_angle = math.radians(36.87)
-    _make_box("Left Roof Slope", (-1.14, 0.0, 3.75), (2.85, 3.5, 0.18), roof,
-              (0.0, -roof_angle, 0.0))
-    _make_box("Right Roof Slope", (1.14, 0.0, 3.75), (2.85, 3.5, 0.18), roof,
-              (0.0, roof_angle, 0.0))
+    _make_box("Left Roof Slope", (-1.14, 0.0, 3.75), (2.85, 3.5, 0.18), roof, (0.0, -roof_angle, 0.0))
+    _make_box("Right Roof Slope", (1.14, 0.0, 3.75), (2.85, 3.5, 0.18), roof, (0.0, roof_angle, 0.0))
     _make_box("Front Door", (0.0, -1.57, 0.92), (0.9, 0.12, 1.84), door)
     _make_box("Porch Step", (0.0, -1.84, 0.09), (1.45, 0.62, 0.18), trim)
     for window_x in (-1.15, 1.15):
@@ -285,8 +383,7 @@ def _build_house(clear_scene=True):
         _make_box("Window Right Trim", (window_x + 0.38, window_y - 0.035, window_z), (0.08, 0.11, 0.82), trim)
         _make_box("Window Center Bar", (window_x, window_y - 0.045, window_z), (0.045, 0.12, 0.66), trim)
     _make_box("Chimney", (1.05, 0.45, 4.25), (0.48, 0.5, 1.25), brick)
-    return {"status": "success", "message": "Built a low-poly house from primitive meshes.",
-            "object_count": len(bpy.context.scene.objects)}
+    return {"status": "success", "message": "Built a low-poly house from primitive meshes.", "object_count": len(bpy.context.scene.objects)}
 
 
 def _get_scene_info(query=""):
@@ -302,8 +399,7 @@ def _get_scene_info(query=""):
             "location": [round(float(v), 3) for v in obj.location],
             "dimensions": [round(float(v), 3) for v in obj.dimensions],
         })
-    return {"scene": scene.name, "blender_version": bpy.app.version_string,
-            "frame": scene.frame_current, "object_count": len(scene.objects), "objects": objects[:100]}
+    return {"scene": scene.name, "blender_version": bpy.app.version_string, "frame": scene.frame_current, "object_count": len(scene.objects), "objects": objects[:100]}
 
 
 def _bpy_api_lookup(query):
@@ -323,10 +419,8 @@ def _bpy_api_lookup(query):
         properties = []
         for prop in rna.properties:
             if prop.identifier != "rna_type":
-                properties.append({"name": prop.identifier, "type": prop.type,
-                                   "description": prop.description})
-        return {"kind": "operator", "idname": "bpy.ops." + ".".join(pieces),
-                "description": rna.description, "parameters": properties}
+                properties.append({"name": prop.identifier, "type": prop.type, "description": prop.description})
+        return {"kind": "operator", "idname": "bpy.ops." + ".".join(pieces), "description": rna.description, "parameters": properties}
     parts = clean.split(".")
     cls = getattr(bpy.types, parts[0], None)
     if cls is None:
@@ -335,56 +429,90 @@ def _bpy_api_lookup(query):
     if len(parts) > 1:
         prop = cls.bl_rna.properties.get(parts[1])
         if prop is not None:
-            return {"kind": "property", "owner_type": parts[0], "name": prop.identifier,
-                    "type": prop.type, "description": prop.description}
+            return {"kind": "property", "owner_type": parts[0], "name": prop.identifier, "type": prop.type, "description": prop.description}
         func = cls.bl_rna.functions.get(parts[1])
         if func is not None:
-            return {"kind": "function", "owner_type": parts[0], "name": func.identifier,
-                    "description": func.description,
-                    "parameters": [p.identifier for p in func.parameters if not p.is_output]}
+            return {"kind": "function", "owner_type": parts[0], "name": func.identifier, "description": func.description, "parameters": [p.identifier for p in func.parameters if not p.is_output]}
         return {"error": "No property or function named " + parts[1]}
-    return {"kind": "type", "name": parts[0], "description": cls.bl_rna.description,
-            "properties": [p.identifier for p in cls.bl_rna.properties if p.identifier != "rna_type"][:100],
-            "functions": [f.identifier for f in cls.bl_rna.functions][:100]}
+    return {"kind": "type", "name": parts[0], "description": cls.bl_rna.description, "properties": [p.identifier for p in cls.bl_rna.properties if p.identifier != "rna_type"][:100], "functions": [f.identifier for f in cls.bl_rna.functions][:100]}
+
+
+def _reject_code_for_freeze(code):
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.While):
+            return True
+        if isinstance(node, ast.FunctionDef):
+            name = (node.name or "").lower()
+            if any(keyword in name for keyword in ("modal", "invoke", "execute", "draw", "poll", "cancel")):
+                return True
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "time":
+                    return True
+        if isinstance(node, ast.ImportFrom):
+            if node.module == "time":
+                return True
+    return False
 
 
 def _execute_blender_code(code):
     if not isinstance(code, str) or not code.strip():
         return {"status": "error", "message": "code must be a non-empty string."}
+    if _reject_code_for_freeze(code):
+        return {"status": "error", "message": "Code rejected: Infinite loops and sleeps are forbidden to prevent main-thread freezing."}
     output = io.StringIO()
     namespace = {"bpy": bpy, "math": math}
     try:
         with contextlib.redirect_stdout(output):
             exec(compile(code, "<MCP Blender request>", "exec"), namespace, namespace)
-        return {"status": "success", "stdout": output.getvalue(),
-                "result": _safe_json(namespace.get("result"))}
+        return {"status": "success", "stdout": output.getvalue(), "result": _safe_json(namespace.get("result"))}
     except Exception as exc:
-        return {"status": "error", "message": str(exc), "traceback": traceback.format_exc(),
-                "stdout": output.getvalue()}
+        return {"status": "error", "message": str(exc), "traceback": traceback.format_exc(), "stdout": output.getvalue()}
+
+
+def _validated_vector(arguments, key, required=False, size=3):
+    value = arguments.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != size:
+        raise ValueError("{} must contain exactly {} numbers.".format(key, size))
+    result = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item):
+            raise ValueError("{} must contain only finite numbers.".format(key))
+        result.append(float(item))
+    return result
 
 
 def _execute_blender_command(request):
     tool = request.get("tool")
     args = request.get("args") or {}
     if tool == "get_addon_status":
-        return {"status": "success", "name": bl_info["name"], "addon_version": list(bl_info["version"]),
-                "blender_version": bpy.app.version_string, "host": HOST, "port": PORT,
-                "capabilities": [item["name"] for item in TOOLS]}
+        return {"status": "success", "name": bl_info["name"], "addon_version": list(bl_info["version"]), "blender_version": bpy.app.version_string, "host": HOST, "port": PORT, "capabilities": [item["name"] for item in TOOLS]}
     if tool == "get_scene_info":
         return {"status": "success", "scene_info": _get_scene_info(args.get("query", ""))}
     if tool in ("execute_blender_code", "execute_code"):
         return _execute_blender_code(args.get("code"))
+    if tool == "clear_undo_history":
+        return _clear_undo_history()
     if tool == "build_house":
+        _clear_undo_history()
         return _build_house(args.get("clear_scene", True))
     if tool == "simplify_mesh":
         active = bpy.context.active_object
         name = args.get("name") or (active.name if active else None)
+        validated = validate_object(name, expected_types=("MESH",))
+        if isinstance(validated, dict) and validated.get("status") == "error":
+            return validated
+        obj = validated
         ratio = float(args.get("ratio", 0.5))
-        if not name or bpy.data.objects.get(name) is None:
-            return {"status": "error", "message": "Target mesh object not found."}
         if not 0.0 < ratio <= 1.0:
             return {"status": "error", "message": "ratio must be greater than 0 and at most 1."}
-        obj = bpy.data.objects[name]
+        _clear_undo_history()
         modifier = obj.modifiers.new(name="MCP Decimate", type="DECIMATE")
         modifier.ratio = ratio
         bpy.context.view_layer.objects.active = obj
@@ -396,9 +524,10 @@ def _execute_blender_command(request):
         return {"status": "success", "message": "Simplified {} to ratio {}.".format(name, ratio)}
     if tool == "animate_camera":
         name = args.get("name", "Camera")
-        cam = bpy.data.objects.get(name)
-        if cam is None or cam.type != "CAMERA":
-            return {"status": "error", "message": "Camera not found: " + name}
+        validated = validate_object(name, expected_types=("CAMERA",))
+        if isinstance(validated, dict) and validated.get("status") == "error":
+            return validated
+        cam = validated
         start = int(args.get("start_frame", 1))
         end = int(args.get("end_frame", 100))
         loc = args.get("location", [0.0, -10.0, 5.0])
@@ -409,25 +538,243 @@ def _execute_blender_command(request):
         cam.location = [loc[0], loc[1] + 5.0, loc[2]]
         cam.keyframe_insert(data_path="location", frame=end)
         return {"status": "success", "message": "Animated {} from frame {} to {}.".format(name, start, end)}
+    if tool == "animate_object":
+        object_name = args.get("object_name")
+        validated = validate_object(object_name, expected_types=("MESH", "CAMERA", "EMPTY", "CURVE", "SURFACE"))
+        if isinstance(validated, dict) and validated.get("status") == "error":
+            return validated
+        obj = validated
+        start_frame = int(args.get("start_frame", 1))
+        end_frame = int(args.get("end_frame", 100))
+        if end_frame <= start_frame:
+            return {"status": "error", "message": "end_frame must exceed start_frame."}
+        interpolation = args.get("interpolation", "BEZIER")
+        if interpolation not in ("BEZIER", "LINEAR", "CONSTANT"):
+            return {"status": "error", "message": "interpolation must be BEZIER, LINEAR, or CONSTANT."}
+        pairs = []
+        for channel, start_key, end_key in (
+                ("location", "start_location", "end_location"),
+                ("rotation_euler", "start_rotation", "end_rotation"),
+                ("scale", "start_scale", "end_scale")):
+            start_value = _validated_vector(args, start_key, required=channel == "location")
+            end_value = _validated_vector(args, end_key, required=channel == "location")
+            if (start_value is None) != (end_value is None):
+                return {"status": "error", "message": "Provide both {} and {} to animate that channel.".format(start_key, end_key)}
+            if start_value is not None:
+                pairs.append((channel, start_value, end_value))
+        for path, start_value, end_value in pairs:
+            setattr(obj, path, start_value)
+            obj.keyframe_insert(data_path=path, frame=start_frame)
+            setattr(obj, path, end_value)
+            obj.keyframe_insert(data_path=path, frame=end_frame)
+        if obj.animation_data and obj.animation_data.action:
+            for curve in obj.animation_data.action.fcurves:
+                for keyframe in curve.keyframe_points:
+                    keyframe.interpolation = interpolation
+        return {"status": "success", "message": "Animated {} from frame {} to {}.".format(object_name, start_frame, end_frame)}
+    if tool == "create_material":
+        name = args.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return {"status": "error", "message": "A non-empty material name is required."}
+        color = _validated_vector(args, "base_color", size=4) or [0.8, 0.8, 0.8, 1.0]
+        if any(component < 0.0 or component > 1.0 for component in color):
+            return {"status": "error", "message": "base_color components must be between 0 and 1."}
+        metallic = float(args.get("metallic", 0.0))
+        roughness = float(args.get("roughness", 0.5))
+        if not math.isfinite(metallic) or not 0.0 <= metallic <= 1.0:
+            return {"status": "error", "message": "metallic must be between 0 and 1."}
+        if not math.isfinite(roughness) or not 0.0 <= roughness <= 1.0:
+            return {"status": "error", "message": "roughness must be between 0 and 1."}
+        object_names = args.get("object_names")
+        if object_names is not None and (not isinstance(object_names, list) or any(not isinstance(item, str) for item in object_names)):
+            return {"status": "error", "message": "object_names must be an array of object-name strings."}
+        material = bpy.data.materials.get(name)
+        if material is None:
+            material = bpy.data.materials.new(name=name)
+        material.use_nodes = True
+        shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
+        if shader is None:
+            shader = material.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
+        shader.inputs["Base Color"].default_value = color
+        shader.inputs["Metallic"].default_value = metallic
+        shader.inputs["Roughness"].default_value = roughness
+        assigned = []
+        targets = list(bpy.context.selected_objects) if object_names is None else []
+        if object_names is not None:
+            for item in object_names:
+                validated = validate_object(item)
+                if isinstance(validated, dict) and validated.get("status") == "error":
+                    return validated
+                targets.append(validated)
+        for obj in targets:
+            if obj is None:
+                continue
+            if obj.data is not None and hasattr(obj.data, "materials"):
+                slots = obj.data.materials
+                if len(slots):
+                    slots[0] = material
+                else:
+                    slots.append(material)
+                assigned.append(obj.name)
+        return {"status": "success", "material": material.name, "assigned_objects": assigned}
+    if tool == "unwrap_uv_mesh":
+        object_name = args.get("object_name")
+        validated = validate_object(object_name, expected_types=("MESH",))
+        if isinstance(validated, dict) and validated.get("status") == "error":
+            return validated
+        obj = validated
+        method = str(args.get("method", "SMART")).upper()
+        island_margin = float(args.get("island_margin", 0.0))
+        if method not in ("SMART", "LIGHTMAP", "ANGLE"):
+            return {"status": "error", "message": "method must be SMART, LIGHTMAP, or ANGLE."}
+        if obj.mode != "EDIT":
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode="EDIT")
+        bpy.ops.mesh.select_all(action="SELECT")
+        if method == "SMART":
+            bpy.ops.uv.smart_project(island_margin=island_margin)
+        elif method == "LIGHTMAP":
+            bpy.ops.uv.lightmap_pack()
+        else:
+            bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=island_margin)
+        bpy.ops.object.mode_set(mode="OBJECT")
+        return {"status": "success", "message": "Unwrapped {} using {}.".format(obj.name, method)}
+    if tool == "setup_hdri_lighting":
+        filepath = args.get("filepath")
+        if not isinstance(filepath, str) or not filepath.strip():
+            return {"status": "error", "message": "filepath is required."}
+        strength = float(args.get("strength", 1.0))
+        rotation_z = float(args.get("rotation_z", 0.0))
+        world = bpy.data.worlds.get("World")
+        if world is None:
+            world = bpy.data.worlds.new("World")
+        world.use_nodes = True
+        tree = world.node_tree
+        bg_node = tree.nodes.get("Background")
+        if bg_node is None:
+            bg_node = tree.nodes.new(type="ShaderNodeBackground")
+        bg_node.name = "Background"
+        env_tex = tree.nodes.get("Environment Texture")
+        if env_tex is None:
+            env_tex = tree.nodes.new(type="ShaderNodeTexEnvironment")
+        env_tex.name = "Environment Texture"
+        mapping = tree.nodes.get("Mapping")
+        if mapping is None:
+            mapping = tree.nodes.new(type="ShaderNodeMapping")
+        mapping.name = "Mapping"
+        if not env_tex.image:
+            env_tex.image = bpy.data.images.load(filepath)
+        else:
+            try:
+                env_tex.image.filepath = filepath
+            except Exception:
+                pass
+        mapping.inputs["Rotation"].default_value[2] = math.radians(rotation_z)
+        bg_node.inputs["Strength"].default_value = strength
+        for link in list(tree.links):
+            if link.to_node == env_tex or link.from_node == env_tex:
+                tree.links.remove(link)
+        for link in list(tree.links):
+            if link.to_node == bg_node or link.from_node == bg_node:
+                if link.from_node is not None and link.from_node.name == "Mapping":
+                    tree.links.remove(link)
+        if mapping.outputs and env_tex.inputs.get("Vector") is not None:
+            tree.links.new(mapping.outputs["Vector"], env_tex.inputs["Vector"])
+        if env_tex.outputs and bg_node.inputs.get("Color") is not None:
+            tree.links.new(env_tex.outputs["Color"], bg_node.inputs["Color"])
+        return {"status": "success", "message": "HDRI lighting was set for World.", "strength": strength, "rotation_z": rotation_z}
+    if tool == "purge_orphan_data":
+        before = {}
+        for attr in ("meshes", "materials", "images", "curves", "cameras", "lattices", "armatures", "texts", "node_groups", "worlds"):
+            if hasattr(bpy.data, attr):
+                before[attr] = len(getattr(bpy.data, attr))
+        try:
+            bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+        after = {}
+        for attr in before:
+            after[attr] = len(getattr(bpy.data, attr))
+        total_before = sum(before.values())
+        total_after = sum(after.values())
+        return {"status": "success", "message": "Purged orphan datablocks.", "before": before, "after": after, "purged_total": max(total_before - total_after, 0)}
+    if tool == "manage_geometry_nodes":
+        object_name = args.get("object_name")
+        validated = validate_object(object_name, expected_types=("MESH",))
+        if isinstance(validated, dict) and validated.get("status") == "error":
+            return validated
+        obj = validated
+        action = str(args.get("action", "ADD")).upper()
+        node_group_name = args.get("node_group_name") or "MCP Geometry Nodes"
+        if action == "ADD":
+            group = bpy.data.node_groups.get(node_group_name)
+            if group is None:
+                group = bpy.data.node_groups.new(type="GEOMETRY", name=node_group_name)
+                if group.inputs.get("Geometry") is None:
+                    group.inputs.new("NodeSocketGeometry", "Geometry")
+                if group.outputs.get("Geometry") is None:
+                    group.outputs.new("NodeSocketGeometry", "Geometry")
+            modifier = obj.modifiers.new(name=node_group_name, type="NODES")
+            modifier.node_group = group
+            return {"status": "success", "message": "Added Geometry Nodes modifier to {}.".format(obj.name), "modifier": modifier.name, "node_group": group.name}
+        if action == "REMOVE":
+            removed = False
+            for modifier in list(obj.modifiers):
+                if modifier.type == "NODES" and (modifier.name == node_group_name or (modifier.node_group and modifier.node_group.name == node_group_name)):
+                    obj.modifiers.remove(modifier)
+                    removed = True
+            if not removed:
+                return {"status": "error", "message": "No Geometry Nodes modifier found for {}.".format(obj.name)}
+            return {"status": "success", "message": "Removed Geometry Nodes modifier from {}.".format(obj.name)}
+        return {"status": "error", "message": "action must be ADD or REMOVE."}
+    if tool == "manage_shape_keys":
+        object_name = args.get("object_name")
+        validated = validate_object(object_name, expected_types=("MESH",))
+        if isinstance(validated, dict) and validated.get("status") == "error":
+            return validated
+        obj = validated
+        action = str(args.get("action", "ADD_TARGET")).upper()
+        shape_key_name = args.get("shape_key_name") or "MCPShapeKey"
+        value = float(args.get("value", 0.0))
+        if action == "ADD_BASIS":
+            if obj.data.shape_keys is None:
+                obj.shape_key_add(name="Basis")
+            return {"status": "success", "message": "Ensured Basis shape key exists for {}.".format(obj.name)}
+        if action == "ADD_TARGET":
+            if obj.data.shape_keys is None:
+                obj.shape_key_add(name="Basis")
+            key = obj.shape_key_add(name=shape_key_name)
+            key.value = 0.0
+            return {"status": "success", "message": "Added shape key {} to {}.".format(shape_key_name, obj.name), "shape_key_name": key.name}
+        if action == "SET_VALUE":
+            if obj.data.shape_keys is None:
+                return {"status": "error", "message": "Object {} has no shape keys.".format(obj.name)}
+            if shape_key_name not in obj.data.shape_keys.key_blocks:
+                return {"status": "error", "message": "Shape key '{}' does not exist on {}.".format(shape_key_name, obj.name)}
+            key = obj.data.shape_keys.key_blocks[shape_key_name]
+            key.value = value
+            return {"status": "success", "message": "Set shape key {} on {} to {}.".format(shape_key_name, obj.name, value), "shape_key_name": key.name, "value": key.value}
+        return {"status": "error", "message": "action must be ADD_BASIS, ADD_TARGET, or SET_VALUE."}
+    if tool == "bpy_api_lookup":
+        return _bpy_api_lookup(args.get("query", ""))
     if tool == "auto_rig_character":
         name = args.get("name")
-        obj = bpy.data.objects.get(name) if name else None
-        if obj is None or obj.type != "MESH":
-            return {"status": "error", "message": "Mesh object not found: {}".format(name)}
-        for item in bpy.context.selected_objects:
+        validated = validate_object(name, expected_types=("MESH",))
+        if isinstance(validated, dict) and validated.get("status") == "error":
+            return validated
+        obj = validated
+        _clear_undo_history()
+        for item in list(bpy.context.selected_objects):
             item.select_set(False)
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
         bpy.ops.object.armature_add(location=obj.location)
         armature = bpy.context.active_object
         armature.name = "AutoRig"
-        bpy.context.view_layer.objects.active = obj
         obj.select_set(True)
         armature.select_set(True)
         bpy.ops.object.parent_set(type="ARMATURE_AUTO")
         return {"status": "success", "message": "Auto-rigged {}.".format(name)}
-    if tool == "bpy_api_lookup":
-        return _bpy_api_lookup(args.get("query", ""))
     return {"status": "error", "message": "Unknown tool: {}".format(tool)}
 
 
@@ -532,10 +879,7 @@ def unregister():
     _SERVER_THREAD = None
 
 
-# -------------------------- MCP stdio implementation ------------------------
-
 def _python_literal(value):
-    """Format a JSON-derived value as a safe Python literal for Blender code."""
     if value is None:
         return "None"
     if isinstance(value, bool):
@@ -549,41 +893,18 @@ def _python_literal(value):
     if isinstance(value, (list, tuple)):
         return "[{}]".format(", ".join(_python_literal(item) for item in value))
     if isinstance(value, dict):
-        return "{{{}}}".format(", ".join(
-            "{}: {}".format(_python_literal(key), _python_literal(item))
-            for key, item in value.items()
-        ))
+        return "{{{}}}".format(", ".join("{}: {}".format(_python_literal(key), _python_literal(item)) for key, item in value.items()))
     raise ValueError("Unsupported argument value type: {}".format(type(value).__name__))
 
 
-def _validated_vector(arguments, key, required=False, size=3):
-    value = arguments.get(key)
-    if value is None and not required:
-        return None
-    if not isinstance(value, (list, tuple)) or len(value) != size:
-        raise ValueError("{} must contain exactly {} numbers.".format(key, size))
-    result = []
-    for item in value:
-        if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item):
-            raise ValueError("{} must contain only finite numbers.".format(key))
-        result.append(float(item))
-    return result
-
-
 def _tool_code(tool_name, arguments):
-    """Build short inline bpy operations for higher-level MCP tools.
-
-    The source is sent over the existing execute_code command; no script file
-    is written and the installed Blender add-on need not know each tool name.
-    """
     if tool_name == "animate_object":
         name = arguments.get("object_name")
         if not isinstance(name, str) or not name:
             raise ValueError("object_name is required.")
         start_frame = arguments.get("start_frame")
         end_frame = arguments.get("end_frame")
-        if (isinstance(start_frame, bool) or not isinstance(start_frame, int) or
-                isinstance(end_frame, bool) or not isinstance(end_frame, int) or end_frame <= start_frame):
+        if (isinstance(start_frame, bool) or not isinstance(start_frame, int) or isinstance(end_frame, bool) or not isinstance(end_frame, int) or end_frame <= start_frame):
             raise ValueError("start_frame and end_frame must be integers and end_frame must be later.")
         interpolation = arguments.get("interpolation", "BEZIER")
         if interpolation not in ("BEZIER", "LINEAR", "CONSTANT"):
@@ -614,7 +935,6 @@ def _tool_code(tool_name, arguments):
             "            key.interpolation = {}".format(_python_literal(interpolation)),
             "result = {'object': obj.name, 'start_frame': %d, 'end_frame': %d, 'channels': [c[0] for c in channels]}" % (start_frame, end_frame),
         ))
-
     if tool_name == "create_material":
         name = arguments.get("name")
         if not isinstance(name, str) or not name.strip():
@@ -629,8 +949,7 @@ def _tool_code(tool_name, arguments):
         if not math.isfinite(roughness) or not 0.0 <= roughness <= 1.0:
             raise ValueError("roughness must be between 0 and 1.")
         object_names = arguments.get("object_names")
-        if object_names is not None and (not isinstance(object_names, list) or
-                                         any(not isinstance(item, str) for item in object_names)):
+        if object_names is not None and (not isinstance(object_names, list) or any(not isinstance(item, str) for item in object_names)):
             raise ValueError("object_names must be an array of object-name strings.")
         return "\n".join((
             "material = bpy.data.materials.get({})".format(_python_literal(name)),
@@ -654,7 +973,6 @@ def _tool_code(tool_name, arguments):
             "        assigned.append(obj.name)",
             "result = {'material': material.name, 'assigned_objects': assigned}",
         ))
-
     if tool_name == "setup_compositing":
         use_glare = arguments.get("use_glare", True)
         clear_existing = arguments.get("clear_existing", True)
@@ -689,7 +1007,6 @@ def _tool_code(tool_name, arguments):
             "scene.render.use_compositing = True",
             "result = {'compositing': True, 'glare': " + _python_literal(use_glare) + "}",
         ))
-
     if tool_name == "set_render_settings":
         engine = arguments.get("engine")
         allowed_engines = ("BLENDER_EEVEE", "CYCLES", "BLENDER_WORKBENCH")
@@ -720,7 +1037,6 @@ def _tool_code(tool_name, arguments):
             ))
         lines.append("result = {'engine': scene.render.engine, 'resolution': [scene.render.resolution_x, scene.render.resolution_y], 'percentage': scene.render.resolution_percentage}")
         return "\n".join(lines)
-
     return None
 
 
@@ -766,12 +1082,7 @@ def _handle_mcp_message(message):
     if method == "notifications/initialized" or (method and method.startswith("notifications/")):
         return None
     if method == "initialize":
-        return _rpc_response(message_id, {
-            "protocolVersion": params.get("protocolVersion", PROTOCOL_VERSION),
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "blender-mcp-single-file", "version": "1.2.0"},
-            "instructions": "Controls Blender 3.1 through a local add-on. Use get_addon_status and get_scene_info before scene edits. execute_blender_code runs in the live Blender process; no code file is written.",
-        })
+        return _rpc_response(message_id, {"protocolVersion": params.get("protocolVersion", PROTOCOL_VERSION), "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "blender-mcp-single-file", "version": "1.2.0"}, "instructions": "Controls Blender 3.1 through a local add-on. Use get_addon_status and get_scene_info before scene edits. execute_blender_code runs in the live Blender process; no code file is written."})
     if method == "ping":
         return _rpc_response(message_id, {})
     if method == "tools/list":

@@ -18,3 +18,13 @@ venv/
 *.blendcache_*/
 render/
 renders/
+
+# Generated image artifacts and previews
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.tif
+*.tiff

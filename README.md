@@ -1,35 +1,59 @@
 # Blender MCP
 
-A lightweight, single-source MCP integration for Blender 3.1. The same `mcp_server.py` runs as a stdio MCP server under regular Python and as the Blender add-on that exposes the live `bpy` runtime over localhost.
+A Blender 3.1 MCP bridge implemented in a single Python source file. The project exposes live Blender operations through a local MCP server and supports both a normal Python stdio mode and a Blender add-on mode without splitting the implementation into multiple scripts.
 
-This project is licensed under the MIT License; see [LICENSE](LICENSE).
+This repository is intentionally kept focused on code and project documentation. Generated image renders are intentionally excluded from version control.
+
+## Project goal
+
+This project provides a lightweight, low-overhead way to:
+
+- inspect the current Blender scene
+- look up Blender API and operator information
+- execute inline Blender Python code safely through MCP
+- create simple environment and prop geometry
+- simplify mesh data
+- animate objects and cameras
+- rig basic character-like meshes
+- assign materials and set compositor/render settings
+
+## Repository layout
+
+- `mcp_server.py` — the main Blender MCP server and add-on implementation
+- `project-instructions.md` — design constraints and safety guidance
+- `README.md` — project overview and usage
+- `LICENSE` — MIT license
+- `.gitignore` — excludes generated artifacts such as image renders and local editor/cache files
 
 ## Requirements
 
 - Blender 3.1.0
-- Python 3.9-compatible interpreter available to VS Code as `python`
-- VS Code with MCP support
+- Python 3.9-compatible interpreter available to VS Code
+- VS Code with MCP support enabled
 
 ## Setup
 
-1. Install `mcp_server.py` as a Blender add-on and enable it in Blender Preferences. The add-on starts its localhost listener on port 9877 by default; set `BLENDER_HOST` or `BLENDER_PORT` to override this.
-2. Open this repository in VS Code. The workspace MCP entry is in `.vscode/mcp.json`; trust and start `blender-lite` from the MCP server list.
-3. In Copilot Chat, open **Configure Tools** and enable the Blender tools.
+1. Open the repository in VS Code.
+2. Ensure the Blender add-on is loaded in Blender or the server is started through the local MCP configuration in `.vscode/mcp.json`.
+3. Start the `blender-lite` MCP server from the VS Code tool list.
+4. Use the available tools in Copilot Chat to interact with the live Blender scene.
 
-The add-on and MCP bridge are separate runtime processes but are implemented in the same source file. Blender API operations are queued onto Blender's main thread. `execute_blender_code` sends code in memory; it does not write per-task script files. Only connect trusted local clients because this tool can execute code inside Blender.
+The add-on and MCP bridge are separated by runtime context, but they share the same source file. Blender API operations are queued to Blender's main thread before execution.
 
-## Tools
+## Safety notes
 
-- `get_addon_status` — Blender/add-on status and capabilities.
-- `get_scene_info` — Inspect current scene objects.
-- `bpy_api_lookup` — Look up Blender 3.1 RNA and operator information.
-- `execute_blender_code` — Run an inline Blender Python operation.
-- `build_house` — Create a lightweight primitive house.
-- `simplify_mesh` — Decimate a mesh.
-- `animate_camera` and `animate_object` — Add transform keyframes.
-- `auto_rig_character` — Create an automatic armature.
-- `create_material` — Create/assign a Principled material.
-- `setup_compositing` — Create a basic compositor graph with optional Fog Glow.
-- `set_render_settings` — Configure render engine, resolution, and samples.
+- Only connect trusted local clients.
+- `execute_blender_code` has the power to run Python in Blender directly.
+- The listener is local-only and should not be exposed externally.
+- This project targets Blender 3.1 APIs and Python 3.9 compatibility.
 
-All Blender-side behavior targets Blender 3.1 and keeps Python syntax compatible with Python 3.9.
+## Typical usage
+
+- Inspect scene state with the status/scene tools.
+- Use `execute_blender_code` for direct inline Blender operations.
+- Use `animate_object` and `animate_camera` for scene motion.
+- Use `create_material` and `set_render_settings` to finish the look.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
